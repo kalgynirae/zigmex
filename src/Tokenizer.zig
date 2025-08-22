@@ -1,7 +1,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
-const ArrayList = std.ArrayListUnmanaged;
+const ArrayList = std.ArrayList;
 
 pub const Token = struct {
     tag: Tag,
@@ -93,6 +93,7 @@ const State = enum {
     string_backslash,
     backslash,
     other,
+    eof,
 };
 
 pub fn next(self: *Self) Token {
@@ -159,10 +160,21 @@ pub fn next(self: *Self) Token {
                 }
             }
         },
+        .eof => {
+            if (self.indents.getLast() != 0) {
+                const current_indent = self.indents.pop() orelse unreachable;
+                const previous_indent = self.indents.getLast();
+                if (self.debug) std.debug.print("dedent: {} -> {}\n", .{ current_indent, previous_indent });
+                result.tag = .dedent;
+                self.next_state = .eof;
+            } else {
+                result.tag = .eof;
+            }
+        },
         .default => switch (self.buffer[self.index]) {
             0 => {
                 if (self.index == self.buffer.len) {
-                    result.tag = .eof;
+                    continue :state .eof;
                 } else {
                     self.index += 1;
                     result.tag = .invalid;
@@ -307,8 +319,8 @@ pub fn next(self: *Self) Token {
 
     result.loc.end = end_override orelse self.index;
     if (self.debug) std.debug.print(
-        "TOKEN {s}(“{s}”)\n",
-        .{ @tagName(result.tag), self.buffer[result.loc.start..result.loc.end] },
+        "TOKEN .{t}(“{s}”)\n",
+        .{ result.tag, self.buffer[result.loc.start..result.loc.end] },
     );
     return result;
 }
@@ -342,6 +354,7 @@ test "indentation" {
         \\    again indented
         \\  unexpectedly indented
         \\end
+        \\
     ;
     var tokenizer = try init(std.testing.allocator, input, .quiet);
     defer tokenizer.deinit(std.testing.allocator);
@@ -357,6 +370,54 @@ test "indentation" {
             else => {},
         }
     }
+    try std.testing.expectEqual(indent_dedent_tags.len, i);
+}
+
+test "dedents before eof" {
+    const input =
+        \\a
+        \\  b
+        \\    c
+        \\
+    ;
+    var tokenizer = try init(std.testing.allocator, input, .quiet);
+    defer tokenizer.deinit(std.testing.allocator);
+    const indent_dedent_tags = [_]Token.Tag{ .indent, .indent, .dedent, .dedent };
+    var i: usize = 0;
+    var token = tokenizer.next();
+    while (token.tag != .eof) : (token = tokenizer.next()) {
+        switch (token.tag) {
+            .indent, .dedent => {
+                try std.testing.expectEqual(indent_dedent_tags[i], token.tag);
+                i += 1;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(indent_dedent_tags.len, i);
+}
+
+test "dedents before eof no newline" {
+    const input =
+        \\a
+        \\  b
+        \\    c
+    ;
+    var tokenizer = try init(std.testing.allocator, input, .quiet);
+    defer tokenizer.deinit(std.testing.allocator);
+    const indent_dedent_tags = [_]Token.Tag{ .indent, .indent, .dedent, .dedent };
+    var i: usize = 0;
+    var token = tokenizer.next();
+    while (token.tag != .eof) : (token = tokenizer.next()) {
+        switch (token.tag) {
+            .indent, .dedent => {
+                try std.testing.expectEqual(indent_dedent_tags[i], token.tag);
+                i += 1;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(indent_dedent_tags.len, i);
 }
 
 test "full example" {
@@ -371,6 +432,7 @@ test "full example" {
         \\
         \\this is not
         \\!what!{bea|n|s}
+        \\
     ;
     var tokenizer = try init(std.testing.allocator, input, .quiet);
     defer tokenizer.deinit(std.testing.allocator);
