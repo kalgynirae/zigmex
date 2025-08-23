@@ -5,31 +5,52 @@ const Reader = std.io.Reader;
 const StringHashMap = std.hash_map.StringHashMapUnmanaged;
 
 const Tokenizer = @import("Tokenizer.zig");
+const tokenize = Tokenizer.tokenize;
 const Token = Tokenizer.Token;
 
 const Self = @This();
 
-allocator: Allocator,
 source: [:0]const u8,
-tokens: []Token,
+tokens: []const Token,
 tok_i: usize,
 debug: bool,
-debug_depth: u8 = 0,
+debug_depth: u8,
+diagnostics: Diagnostics,
 
-var debug_msg: [256]u8 = @splat(0);
+fn init(buffer: [:0]const u8, tokens: []Token, verbosity: Verbosity) Self {
+    return .{
+        .source = buffer,
+        .tokens = tokens,
+        .tok_i = 0,
+        .debug = verbosity == .debug,
+        .debug_depth = 0,
+        .diagnostics = .empty,
+    };
+}
+
+const Diagnostics = struct {
+    error_loc: ?usize,
+    message: [1024]u8,
+
+    pub const empty: @This() = .{
+        .error_loc = null,
+        .message = @splat(0),
+    };
+};
 
 pub const Verbosity = enum {
     quiet,
     debug,
 };
 
-pub fn deinit(self: *Self, gpa: Allocator) void {
-    gpa.free(self.tokens);
+fn deinit(self: *Self, gpa: Allocator) void {
+    _ = self;
+    _ = gpa;
 }
 
 fn log(self: Self, comptime fmt: []const u8, args: anytype) void {
     if (!self.debug) return;
-    @memset(&debug_msg, 0);
+    var debug_msg: [256]u8 = @splat(0);
     var i: u8 = 0;
     while (i < self.debug_depth * 2 and i < debug_msg.len) : (i += 1) {
         debug_msg[i] = if (i % 2 == 0) '|' else ' ';
@@ -60,10 +81,11 @@ fn consume(self: *Self, tag: Token.Tag) !Token {
     const tok = self.tokens[self.tok_i];
     if (tok.tag == tag) {
         self.tok_i += 1;
-        self.log("consume(.{t})", .{tok.tag});
+        self.log("\x1b[32mconsume\x1b[39m(.\x1b[34m{t}\x1b[39m)", .{tok.tag});
         return tok;
     } else {
-        self.log("consume failed: wanted .{t} but got .{t}", .{ tag, tok.tag });
+        self.diagnostics.error_loc = tok.loc.start;
+        _ = std.fmt.bufPrintZ(&self.diagnostics.message, "Expected {t} but found {t}", .{ tag, tok.tag }) catch {};
         return error.UnexpectedToken;
     }
 }
@@ -76,7 +98,7 @@ fn consumeAny(self: *Self, comptime tags: []const Token.Tag) ?Token {
     inline for (tags) |tag| {
         if (tok.tag == tag) {
             self.tok_i += 1;
-            self.log("consumeAny(.{t})", .{tok.tag});
+            self.log("\x1b[32mconsumeAny\x1b[39m(.\x1b[34m{t}\x1b[39m)", .{tok.tag});
             return tok;
         }
     }
@@ -99,7 +121,7 @@ fn skipAny(self: *Self, comptime tags: []const Token.Tag) void {
         inline for (tags) |tag| {
             if (tok.tag == tag) {
                 self.tok_i += 1;
-                self.log("skipAny(.{t})", .{tok.tag});
+                self.log("\x1b[30mskipAny\x1b[39m(.\x1b[34m{t}\x1b[39m)", .{tok.tag});
                 continue :loop;
             }
         }
@@ -273,17 +295,14 @@ fn parseSpan(self: *Self, gpa: Allocator, until_delimiter: ?Token.Tag) ParseErro
     };
 }
 
-pub fn parseTextSpan(self: *Self, gpa: Allocator) !?Node {
+fn parseTextSpan(self: *Self, gpa: Allocator) !?Node {
     std.debug.assert(self.nextIsAny(&text_tags));
     self.log_enter("parseTextSpan", .{});
     var text: ArrayList(u8) = .empty;
     errdefer text.deinit(gpa);
     while (self.nextIsAny(&text_tags)) {
         const token = self.consumeAny(&text_tags).?;
-        switch (token.tag) {
-            .newline => try text.append(gpa, ' '),
-            else => try text.appendSlice(gpa, self.source[token.loc.start..token.loc.end]),
-        }
+        try text.appendSlice(gpa, self.source[token.loc.start..token.loc.end]);
     }
     const text_slice = try text.toOwnedSlice(gpa);
     self.log_exit("text: “{s}”", .{text_slice});
@@ -295,7 +314,7 @@ pub fn parseTextSpan(self: *Self, gpa: Allocator) !?Node {
     };
 }
 
-pub fn parseDelimiterSpan(self: *Self, gpa: Allocator) !?Node {
+fn parseDelimiterSpan(self: *Self, gpa: Allocator) !?Node {
     std.debug.assert(self.nextIsAny(&delimiter_tags));
     self.log_enter("parseDelimiterSpan", .{});
     const open_delimiter = self.consumeAny(&delimiter_tags).?.tag;
@@ -326,33 +345,22 @@ pub fn parseDelimiterSpan(self: *Self, gpa: Allocator) !?Node {
     }
 }
 
-pub fn parse(gpa: Allocator, source: [:0]const u8, verbosity: Verbosity) !Self {
-    var tokenizer = try Tokenizer.init(gpa, source, .quiet);
-    defer tokenizer.deinit(gpa);
-
-    var tokens: ArrayList(Token) = .empty;
-    errdefer tokens.deinit(gpa);
-    while (true) {
-        const token = tokenizer.next();
-        try tokens.append(gpa, token);
-        if (token.tag == .eof) break;
+pub fn parseDocument(self: *Self, gpa: Allocator) !void {
+    while (self.tokens[self.tok_i].tag != .eof) {
+        _ = try self.parseAny(gpa);
     }
-    std.debug.assert(tokens.items.len > 0);
+}
 
-    const tokens_slice = try tokens.toOwnedSlice(gpa);
-    errdefer gpa.free(tokens_slice);
-
-    var parser: Self = .{
-        .allocator = gpa,
-        .source = source,
-        .tokens = tokens_slice,
-        .tok_i = 0,
-        .debug = verbosity == .debug,
-    };
-    while (parser.tokens[parser.tok_i].tag != .eof) {
-        _ = try parser.parseAny(gpa);
-    }
-    return parser;
+pub fn parseBuffer(
+    gpa: Allocator,
+    buffer: [:0]const u8,
+    diagnostics: *Diagnostics,
+    verbosity: Verbosity,
+) !void {
+    const tokens = tokenize(gpa, buffer, .quiet);
+    var parser: Self = init(buffer, tokens, verbosity);
+    defer parser.deinit(gpa);
+    return try parser.parseDocument(gpa);
 }
 
 pub fn parseFile(gpa: Allocator, path: []const u8, verbosity: Verbosity) !Self {
@@ -365,18 +373,29 @@ pub fn parseFile(gpa: Allocator, path: []const u8, verbosity: Verbosity) !Self {
         0,
     );
     errdefer gpa.free(buffer);
-    return try parse(gpa, buffer, verbosity);
+    return try parseBuffer(gpa, buffer, verbosity);
+}
+
+test "no parse" {
+    const input = "";
+    const tokens = tokenize()
+    var parser = init(input, .quiet);
+    defer parser.deinit(std.testing.allocator);
 }
 
 test "parse" {
-    const input =
+    const source =
         \\foo
         \\
-        \\::bar(a, b=5, c, d="x y z")
+        \\::bar(a, b=5, c, d="x y z"
         \\    test
         \\    test2 **test3** |foo *bar*|
         \\
     ;
-    var parser = try parse(std.testing.allocator, input, .debug);
-    defer parser.deinit(std.testing.allocator);
+    const tokens = try tokenize(std.testing.allocator, source, .quiet);
+    var diagnostics: Diagnostics = .empty;
+    errdefer if (diagnostics.error_loc) |loc| {
+        std.debug.print("Error at {}: {s}\n", .{ loc, diagnostics.message });
+    };
+    try parseBuffer(std.testing.allocator, source, tokens, &diagnostics, .debug);
 }

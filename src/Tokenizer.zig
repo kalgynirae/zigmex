@@ -3,6 +3,22 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 
+pub fn tokenize(gpa: Allocator, buffer: [:0]const u8, verbosity: Verbosity) ![]Token {
+    var tokenizer = try init(gpa, buffer, verbosity);
+    defer tokenizer.deinit(gpa);
+
+    var tokens: ArrayList(Token) = .empty;
+    errdefer tokens.deinit(gpa);
+
+    while (true) {
+        const token = tokenizer.next();
+        try tokens.append(gpa, token);
+        if (token.tag == .eof) break;
+    }
+    std.debug.assert(tokens.items.len > 0);
+    return try tokens.toOwnedSlice(gpa);
+}
+
 pub const Token = struct {
     tag: Tag,
     loc: Loc,
