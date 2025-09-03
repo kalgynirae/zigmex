@@ -198,7 +198,8 @@ fn parseRaw(self: *Self, gpa: Allocator) !?Node {
     const name = try gpa.dupe(u8, self.source[name_token.loc.start..name_token.loc.end]);
     errdefer gpa.free(name);
 
-    const argskwargs = try self.parseArgs(gpa);
+    var argskwargs = try self.parseArgs(gpa);
+    errdefer if (argskwargs) |*ak| ak.deinit(gpa);
 
     self.skipAny(&.{.newline});
     _ = try self.consume(.indent);
@@ -218,6 +219,7 @@ const ArgsKwargs = struct {
         .args = .empty,
         .kwargs = .empty,
     };
+
     pub fn deinit(self: *@This(), gpa: Allocator) void {
         for (self.args.items) |slice| gpa.free(slice);
         self.args.deinit(gpa);
@@ -535,17 +537,41 @@ test "parse args" {
     try std.testing.expectEqual(args.args.items.len, 1);
 }
 
+test "parse span" {
+    const buf = ":foo:(bar){test}";
+    const tokens = try tokenize(std.testing.allocator, buf, .quiet);
+    var diagnostics: Diagnostics = .empty;
+    errdefer diagnostics.print();
+    var parser = init(buf, tokens, &diagnostics, .quiet);
+    defer parser.deinit(std.testing.allocator);
+    var node = (try parser.parseSpan(std.testing.allocator, null)).?;
+    defer node.deinit(std.testing.allocator);
+    try std.testing.expectEqual(false, try parser.parseAny(std.testing.allocator));
+}
+
 test "parse raw" {
     const buf =
-        \\!!test(a, b)
-        \\    foo
-        \\
+        \\!!test(a, b, c=5)
+        \\    foo   bar
     ;
     const tokens = try tokenize(std.testing.allocator, buf, .quiet);
     var diagnostics: Diagnostics = .empty;
     errdefer diagnostics.print();
-    var parser = init(buf, tokens, &diagnostics, .debug);
+    var parser = init(buf, tokens, &diagnostics, .quiet);
     defer parser.deinit(std.testing.allocator);
     var node = (try parser.parseRaw(std.testing.allocator)).?;
     defer node.deinit(std.testing.allocator);
+}
+
+test "parse invalid raw" {
+    const buf =
+        \\!!test(a, b, c=5)
+        \\foo
+    ;
+    const tokens = try tokenize(std.testing.allocator, buf, .quiet);
+    var diagnostics: Diagnostics = .empty;
+    errdefer diagnostics.print();
+    var parser = init(buf, tokens, &diagnostics, .quiet);
+    defer parser.deinit(std.testing.allocator);
+    try std.testing.expectError(error.UnexpectedToken, parser.parseRaw(std.testing.allocator));
 }
