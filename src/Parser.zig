@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const Reader = std.io.Reader;
+const Writer = std.io.Writer;
 const StringHashMap = std.hash_map.StringHashMapUnmanaged;
 
 const Tokenizer = @import("Tokenizer.zig");
@@ -15,16 +16,16 @@ tokens: []const Token,
 tok_i: usize,
 debug: bool,
 debug_depth: u8,
-diagnostics: Diagnostics,
+diagnostics: ?*Diagnostics,
 
-fn init(buffer: [:0]const u8, tokens: []Token, verbosity: Verbosity) Self {
+fn init(buffer: [:0]const u8, tokens: []const Token, diagnostics: ?*Diagnostics, verbosity: Verbosity) Self {
     return .{
         .source = buffer,
         .tokens = tokens,
         .tok_i = 0,
         .debug = verbosity == .debug,
         .debug_depth = 0,
-        .diagnostics = .empty,
+        .diagnostics = diagnostics,
     };
 }
 
@@ -36,6 +37,12 @@ const Diagnostics = struct {
         .error_loc = null,
         .message = @splat(0),
     };
+
+    pub fn print(self: @This()) void {
+        if (self.error_loc) |loc| {
+            std.debug.print("Error at byte {}: {s}\n", .{ loc, self.message });
+        }
+    }
 };
 
 pub const Verbosity = enum {
@@ -44,8 +51,7 @@ pub const Verbosity = enum {
 };
 
 fn deinit(self: *Self, gpa: Allocator) void {
-    _ = self;
-    _ = gpa;
+    gpa.free(self.tokens);
 }
 
 fn log(self: Self, comptime fmt: []const u8, args: anytype) void {
@@ -84,8 +90,10 @@ fn consume(self: *Self, tag: Token.Tag) !Token {
         self.log("\x1b[32mconsume\x1b[39m(.\x1b[34m{t}\x1b[39m)", .{tok.tag});
         return tok;
     } else {
-        self.diagnostics.error_loc = tok.loc.start;
-        _ = std.fmt.bufPrintZ(&self.diagnostics.message, "Expected {t} but found {t}", .{ tag, tok.tag }) catch {};
+        if (self.diagnostics) |d| {
+            d.error_loc = tok.loc.start;
+            _ = std.fmt.bufPrintZ(&d.message, "Expected {t} but found {t}", .{ tag, tok.tag }) catch {};
+        }
         return error.UnexpectedToken;
     }
 }
@@ -142,7 +150,9 @@ fn parseAny(self: *Self, gpa: Allocator) ParseError!bool {
         self.log_exit("true", .{});
         return true;
     }
-    if (try self.parseRaw(gpa)) {
+    var raw = try self.parseRaw(gpa);
+    if (raw) |*r| {
+        r.deinit(gpa);
         self.log_exit("true", .{});
         return true;
     }
@@ -164,7 +174,10 @@ fn parseBlock(self: *Self, gpa: Allocator) !bool {
         return false;
     };
     _ = try self.consume(.word);
-    _ = try self.parseArgs(gpa);
+    var args = try self.parseArgs(gpa);
+    if (args) |*a| {
+        defer a.deinit(gpa);
+    }
     self.skipAny(&.{ .space, .newline });
     _ = try self.consume(.indent);
     while (try self.parseAny(gpa)) {}
@@ -173,51 +186,164 @@ fn parseBlock(self: *Self, gpa: Allocator) !bool {
     return true;
 }
 
-fn parseRaw(self: *Self, gpa: Allocator) !bool {
+fn parseRaw(self: *Self, gpa: Allocator) !?Node {
     self.log_enter("parseRaw", .{});
-    errdefer self.log_exit("false", .{});
+    errdefer self.log_exit("err", .{});
     _ = self.consume(.bangbang) catch {
-        self.log_exit("false", .{});
-        return false;
+        self.log_exit("null", .{});
+        return null;
     };
-    _ = try self.consume(.word);
-    _ = try self.parseArgs(gpa);
+
+    const name_token = try self.consume(.word);
+    const name = try gpa.dupe(u8, self.source[name_token.loc.start..name_token.loc.end]);
+    errdefer gpa.free(name);
+
+    const argskwargs = try self.parseArgs(gpa);
+
+    self.skipAny(&.{.newline});
     _ = try self.consume(.indent);
     while (try self.parseAny(gpa)) {}
     _ = try self.consume(.dedent);
     self.log_exit("true", .{});
-    return true;
+    return try Node.fromArgsKwargs(gpa, name, argskwargs orelse .empty, .{ .text = try gpa.dupe(u8, "TODO") });
 }
 
-fn parseArgs(self: *Self, gpa: Allocator) !bool {
-    self.log_enter("parseArgs", .{});
-    _ = gpa;
-    errdefer self.log_exit("false", .{});
-    _ = self.consume(.l_paren) catch {
-        self.log_exit("false", .{});
-        return false;
+const ArgsKwargs = struct {
+    // NOTE: Args owns the backing memory of the string slices it contains
+
+    args: ArrayList([]u8),
+    kwargs: StringHashMap([]u8),
+
+    const empty: @This() = .{
+        .args = .empty,
+        .kwargs = .empty,
     };
+    pub fn deinit(self: *@This(), gpa: Allocator) void {
+        for (self.args.items) |slice| gpa.free(slice);
+        self.args.deinit(gpa);
+
+        var iter = self.kwargs.iterator();
+        while (iter.next()) |entry| {
+            gpa.free(entry.key_ptr.*);
+            gpa.free(entry.value_ptr.*);
+        }
+        self.kwargs.deinit(gpa);
+    }
+
+    pub fn format(self: @This(), w: *Writer) Writer.Error!void {
+        _ = try w.write("Args(");
+        var printed_an_item = false;
+
+        for (self.args.items) |slice| {
+            if (printed_an_item) _ = try w.write(", ");
+            try w.print("{s}", .{slice});
+            printed_an_item = true;
+        }
+
+        var iter = self.kwargs.iterator();
+        while (iter.next()) |entry| {
+            if (printed_an_item) _ = try w.write(", ");
+            try w.print("{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.* });
+            printed_an_item = true;
+        }
+
+        _ = try w.write(")");
+    }
+};
+
+fn parseArgs(self: *Self, gpa: Allocator) !?ArgsKwargs {
+    self.log_enter("parseArgs", .{});
+    errdefer self.log_exit("err", .{});
+    _ = self.consume(.l_paren) catch {
+        self.log_exit("null", .{});
+        return null;
+    };
+
+    var result: ArgsKwargs = .{
+        .args = .empty,
+        .kwargs = .empty,
+    };
+    errdefer result.args.deinit(gpa);
+    errdefer result.kwargs.deinit(gpa);
+
     while (true) : (self.skipAny(&.{ .comma, .space })) {
-        _ = self.consume(.word) catch break;
-        _ = self.consume(.equals) catch continue;
-        _ = self.consumeAny(&.{ .word, .text }) orelse return error.UnexpectedToken;
+        self.skipAny(&.{.space});
+
+        const wordToken = self.consume(.word) catch break;
+        const word = try gpa.dupe(u8, self.source[wordToken.loc.start..wordToken.loc.end]);
+        errdefer gpa.free(word);
+
+        _ = self.consume(.equals) catch {
+            try result.args.append(gpa, word);
+            continue;
+        };
+
+        const valueToken = self.consumeAny(&.{ .word, .text }) orelse return error.UnexpectedToken;
+        const value = try gpa.dupe(u8, self.source[valueToken.loc.start..valueToken.loc.end]);
+        errdefer gpa.free(value);
+
+        try result.kwargs.put(gpa, word, value);
     }
     _ = try self.consume(.r_paren);
-    self.log_exit("true", .{});
-    return true;
+    self.log_exit("{f}", .{result});
+    return result;
 }
 
 const Node = struct {
     name: []u8,
-    args: ArrayList([]u8),
+    args: [][]u8,
     kwargs: StringHashMap([]u8),
     data: NodeData,
 
     fn deinit(self: *@This(), gpa: Allocator) void {
         gpa.free(self.name);
-        self.args.deinit(gpa);
+
+        for (self.args) |arg| {
+            gpa.free(arg);
+        }
+        gpa.free(self.args);
+
+        var iter = self.kwargs.iterator();
+        while (iter.next()) |entry| {
+            gpa.free(entry.key_ptr.*);
+            gpa.free(entry.value_ptr.*);
+        }
         self.kwargs.deinit(gpa);
+
         self.data.deinit(gpa);
+    }
+
+    fn fromArgsKwargs(
+        gpa: Allocator,
+        name: []u8,
+        argskwargs: ArgsKwargs,
+        data: NodeData,
+    ) !@This() {
+        var ak = argskwargs;
+        defer ak.deinit(gpa);
+
+        const args = try ak.args.toOwnedSlice(gpa);
+        errdefer {
+            for (args) |slice| gpa.free(slice);
+            gpa.free(args);
+        }
+
+        const kwargs = ak.kwargs.move();
+        errdefer {
+            var iter = kwargs.iterator();
+            while (iter.next()) |entry| {
+                gpa.free(entry.key_ptr.*);
+                gpa.free(entry.value_ptr.*);
+            }
+            kwargs.deinit(gpa);
+        }
+
+        return .{
+            .name = name,
+            .args = args,
+            .kwargs = kwargs,
+            .data = data,
+        };
     }
 };
 
@@ -289,7 +415,7 @@ fn parseSpan(self: *Self, gpa: Allocator, until_delimiter: ?Token.Tag) ParseErro
     self.log_exit("nodes: ({})", .{nodes.items.len});
     return .{
         .name = try gpa.dupe(u8, "todo"),
-        .args = .empty,
+        .args = &.{},
         .kwargs = .empty,
         .data = .{ .nodes = try nodes.toOwnedSlice(gpa) },
     };
@@ -308,7 +434,7 @@ fn parseTextSpan(self: *Self, gpa: Allocator) !?Node {
     self.log_exit("text: “{s}”", .{text_slice});
     return .{
         .name = try gpa.dupe(u8, "todo"),
-        .args = .empty,
+        .args = &.{},
         .kwargs = .empty,
         .data = .{ .text = text_slice },
     };
@@ -330,7 +456,7 @@ fn parseDelimiterSpan(self: *Self, gpa: Allocator) !?Node {
         self.log_exit("inner span", .{});
         return .{
             .name = try gpa.dupe(u8, @tagName(open_delimiter)),
-            .args = .empty,
+            .args = &.{},
             .kwargs = .empty,
             .data = .{ .nodes = nodes },
         };
@@ -338,7 +464,7 @@ fn parseDelimiterSpan(self: *Self, gpa: Allocator) !?Node {
         self.log_exit("empty", .{});
         return .{
             .name = try gpa.dupe(u8, @tagName(open_delimiter)),
-            .args = .empty,
+            .args = &.{},
             .kwargs = .empty,
             .data = .{ .text = "" },
         };
@@ -357,8 +483,8 @@ pub fn parseBuffer(
     diagnostics: *Diagnostics,
     verbosity: Verbosity,
 ) !void {
-    const tokens = tokenize(gpa, buffer, .quiet);
-    var parser: Self = init(buffer, tokens, verbosity);
+    const tokens = try tokenize(gpa, buffer, .quiet);
+    var parser: Self = init(buffer, tokens, diagnostics, verbosity);
     defer parser.deinit(gpa);
     return try parser.parseDocument(gpa);
 }
@@ -378,24 +504,48 @@ pub fn parseFile(gpa: Allocator, path: []const u8, verbosity: Verbosity) !Self {
 
 test "no parse" {
     const input = "";
-    const tokens = tokenize()
-    var parser = init(input, .quiet);
+    const tokens = try tokenize(std.testing.allocator, input, .quiet);
+    var parser = init(input, tokens, null, .quiet);
     defer parser.deinit(std.testing.allocator);
 }
 
-test "parse" {
+test "full parse" {
     const source =
         \\foo
         \\
-        \\::bar(a, b=5, c, d="x y z"
+        \\::bar(a, b=5, c, d="x y z")
         \\    test
         \\    test2 **test3** |foo *bar*|
         \\
     ;
-    const tokens = try tokenize(std.testing.allocator, source, .quiet);
     var diagnostics: Diagnostics = .empty;
-    errdefer if (diagnostics.error_loc) |loc| {
-        std.debug.print("Error at {}: {s}\n", .{ loc, diagnostics.message });
-    };
-    try parseBuffer(std.testing.allocator, source, tokens, &diagnostics, .debug);
+    errdefer diagnostics.print();
+    try parseBuffer(std.testing.allocator, source, &diagnostics, .quiet);
+}
+
+test "parse args" {
+    const buf = "(a=1, b, c=\"foo bar\")";
+    const tokens = try tokenize(std.testing.allocator, buf, .quiet);
+    var diagnostics: Diagnostics = .empty;
+    errdefer diagnostics.print();
+    var parser = init(buf, tokens, &diagnostics, .quiet);
+    defer parser.deinit(std.testing.allocator);
+    var args = (try parser.parseArgs(std.testing.allocator)).?;
+    defer args.deinit(std.testing.allocator);
+    try std.testing.expectEqual(args.args.items.len, 1);
+}
+
+test "parse raw" {
+    const buf =
+        \\!!test(a, b)
+        \\    foo
+        \\
+    ;
+    const tokens = try tokenize(std.testing.allocator, buf, .quiet);
+    var diagnostics: Diagnostics = .empty;
+    errdefer diagnostics.print();
+    var parser = init(buf, tokens, &diagnostics, .debug);
+    defer parser.deinit(std.testing.allocator);
+    var node = (try parser.parseRaw(std.testing.allocator)).?;
+    defer node.deinit(std.testing.allocator);
 }
